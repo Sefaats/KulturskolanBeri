@@ -2,9 +2,14 @@ name: Bevaka Kulturskolan
 
 on:
   schedule:
-    # Var 15:e minut kl 06-19 UTC (= ca 07-21 svensk tid). Skriptet sköter
-    # den exakta tysta tiden 20:00-08:00 och bevakningsperioderna.
-    - cron: "*/15 6-19 * * *"
+    # Långa kurser: var 30:e minut kl 06-19 UTC (skriptet håller sig till 08-20
+    # svensk tid och till bevakningsperioderna).
+    - cron: "*/30 6-19 * * *"
+    # Långa kurser: var 5:e minut den 18 december, då vårens långa kurser öppnar.
+    # GitHub tillåter inte tätare än 5 minuter.
+    - cron: "*/5 6-19 18 12 *"
+    # Korta kurser: en gång per dag, året runt (07:45 UTC = 08:45 eller 09:45 svensk tid).
+    - cron: "45 7 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -39,12 +44,21 @@ jobs:
       - name: Kör bevakningen
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          MODE: ${{ inputs.mode }}
         run: |
-          case "${{ inputs.mode }}" in
-            test)     python kulturskolan_notiser.py --test ;;
-            discover) python kulturskolan_notiser.py --discover ;;
-            *)        python kulturskolan_notiser.py ;;
-          esac
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            case "$MODE" in
+              test)     python kulturskolan_notiser.py --test ;;
+              discover) python kulturskolan_notiser.py --discover ;;
+              *)        python kulturskolan_notiser.py --scope all --force ;;
+            esac
+          elif [ "$SCHEDULE" = "45 7 * * *" ]; then
+            python kulturskolan_notiser.py --scope short
+          else
+            python kulturskolan_notiser.py --scope long
+          fi
 
       - name: Spara rådata vid discover
         if: ${{ inputs.mode == 'discover' }}
