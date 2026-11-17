@@ -2,29 +2,31 @@
 """
 Bevakar Kulturskolan Stockholms kurskatalog och skickar notiser via ntfy.
 
-Katalogens lista innehåller kurstyper (t.ex. "Piano - långa kurser") men inte
-plats, ålder eller lediga platser, så bevakningen kan inte filtrera på
-Kungsholmen eller födelseår. I stället får du notis när:
-  1. bannertexten i katalogen ändras (t.ex. "vårens långa kurser är öppna"),
-  2. nya kurstyper dyker upp i katalogen,
-  3. en kurstyp blir direktbokningsbar.
-Använd sedan filtren Födelseår 2020 och Stadsdel Kungsholmen i katalogen.
+Filter (samma som i katalogens egna filter):
+  - Stadsdel: Kungsholmens stadsdelsområde (id 8)
+  - Födelseår: 2020
+  - Bara bokningsbara kurstyper ("Visa bokningsbara tider")
+
+Du får notis när en kurstyp som matchar blir bokningsbar (ny eller åter ledig).
+Kurstyper utan lediga platser, på annan plats eller för annan ålder ger ingen notis.
+
+TVÅ BEVAKNINGAR (--scope)
+  long   Långa kurser (allt som inte är korta kurser). Kollas var 30:e minut,
+         var 5:e minut den 18 december, bara under ACTIVE_PERIODS. Notis också
+         om bannertexten i katalogen ändras.
+  short  Korta kurser, lovkurser, dagkollo och prova på. Kollas en gång per dag,
+         året runt.
 
 TIDER
-  - Inga kontroller och inga notiser mellan 20:00 och 08:00 (svensk tid).
-    Det som dyker upp på natten meddelas vid första kontrollen efter 08:00.
-  - Bevakningen är bara aktiv under perioderna i ACTIVE_PERIODS nedan.
+  Inga kontroller och inga notiser mellan 20:00 och 08:00 (svensk tid).
 
 KÖRNING
-  Avsett att köras av GitHub Actions (se kulturskolan.yml), men fungerar
-  också på en vanlig dator:
+  Avsett att köras av GitHub Actions (se kulturskolan.yml). På en vanlig dator:
     pip install requests playwright && playwright install chromium
     export NTFY_TOPIC="ditt-hemliga-amnesnamn"
-    python kulturskolan_notiser.py --test        # testnotis
-    python kulturskolan_notiser.py --discover    # utforska katalogens dataanrop
-    python kulturskolan_notiser.py               # en kontroll (för schema/cron)
-    python kulturskolan_notiser.py --loop        # kontrollerar var 10:e minut
-    Lägg till --force för att köra utanför tider/perioder (t.ex. vid test).
+    python kulturskolan_notiser.py --test            # testnotis
+    python kulturskolan_notiser.py --discover        # utforska katalogens dataanrop
+    python kulturskolan_notiser.py --scope all --force   # kontrollera nu, ignorera tider
 """
 import argparse
 import json
@@ -43,22 +45,32 @@ CATALOGUE_URL = "https://sestockholm.speedadmin.dk/play/catalogue/courses"
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 
+DISTRICT_IDS = [8]     # Kungsholmens stadsdelsområde
+BIRTH_YEARS = [2020]   # barnet är fött 2020
+
+# Kurstyper vars namn matchar räknas som "korta" och bevakas en gång per dag.
+SHORT_RE = re.compile(r"korta|lovkurs|dagkollo|prova på", re.I)
+
 TZ = ZoneInfo("Europe/Stockholm")
 AWAKE_FROM, AWAKE_TO = 8, 20        # kontroller/notiser bara 08:00-20:00
 
-# Perioder då bevakningen är på, som (start, slut) i formatet "MM-DD".
-# Perioder får gå över årsskiftet. Tom lista = alltid på.
-# OBS: Detta är min gissning, Kulturskolan publicerar inget fast släppdatum.
+# Perioder för bevakningen av långa kurser, som (start, slut) i "MM-DD".
+# Perioder får gå över årsskiftet. Tom lista = alltid på. De korta kurserna
+# bevakas alltid, oavsett period.
 ACTIVE_PERIODS = [
-    ("11-15", "01-31"),   # inför vårterminen (långa kurser startar i januari)
+    ("11-15", "01-31"),   # inför vårterminen (långa kurser öppnar 18 december)
     ("04-15", "06-15"),   # inför höstterminen
     ("08-01", "09-15"),   # terminsstart och eftersläpp av platser
 ]
 
-INTERVAL_SECONDS = 600              # bara för --loop. Gå inte under ca 5 min.
+INTERVAL_SECONDS = 1800             # bara för --loop
 STATE_FILE = Path(__file__).with_name("kulturskolan_state.json")
-STATE_VERSION = 3   # höj när tolkningen ändras, så nollställs gammalt tillstånd
+STATE_VERSION = 4   # höj när tolkningen ändras, så nollställs gammalt tillstånd
 # --------------------------------------------------------------------------
+
+LIST_URL_PART = "getcoursecatalogueofferingbasesbyfilter"
+DROP_HEADERS = {"content-length", "host", "connection", "accept-encoding"}
+
 
 # ------------------------------- tider ------------------------------------
 def in_active_period(now):
@@ -78,11 +90,11 @@ def in_awake_hours(now):
     return AWAKE_FROM <= now.hour < AWAKE_TO
 
 
-def should_run(force=False, now=None):
+def should_run(scope, force=False, now=None):
     now = now or datetime.now(TZ)
     if force:
         return True, ""
-    if not in_active_period(now):
+    if scope == "long" and not in_active_period(now):
         return False, "utanför bevakningsperiod"
     if not in_awake_hours(now):
         return False, f"tyst tid ({AWAKE_TO}:00-{AWAKE_FROM:02d}:00)"
@@ -109,31 +121,58 @@ def notify(title, message, priority=3, tags=None, click=CATALOGUE_URL):
 
 
 # --------------------------- hämta katalogen -------------------------------
-def fetch_payloads():
-    """Laddar katalogen i en headless-webbläsare och fångar alla JSON-svar."""
+def fetch_catalogue():
+    """Laddar katalogen och frågar efter bokningsbara kurstyper med våra filter.
+
+    Sidans eget anrop till kurslistan fångas (med sina huvuden), och samma anrop
+    skickas sedan igen med filtren Stadsdel, Födelseår och onlyAvailable.
+    Returnerar (bannerdata, svar med bokningsbara, svar med alla).
+    """
     from playwright.sync_api import sync_playwright
 
-    payloads = []
+    seen, pages = {}, []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         ctx = browser.new_context(locale="sv-SE")
         page = ctx.new_page()
 
+        def on_request(req):
+            if LIST_URL_PART in req.url and "req" not in seen:
+                seen["req"] = req
+
         def on_response(resp):
             try:
-                if "json" in (resp.headers.get("content-type") or ""):
-                    payloads.append((resp.url, resp.json()))
+                if "/getpage" in resp.url and "json" in (resp.headers.get("content-type") or ""):
+                    pages.append(resp.json())
             except Exception:
                 pass
 
+        page.on("request", on_request)
         page.on("response", on_response)
         page.goto(CATALOGUE_URL, wait_until="networkidle", timeout=60000)
-        for _ in range(15):  # scrolla så att fler kurser laddas
-            page.mouse.wheel(0, 4000)
-            page.wait_for_timeout(700)
-        page.wait_for_load_state("networkidle")
+        if "req" not in seen:
+            raise RuntimeError("Såg inget anrop till kurslistan - ändrad sidstruktur?")
+
+        url = seen["req"].url
+        headers = {k: v for k, v in seen["req"].all_headers().items() if k.lower() not in DROP_HEADERS}
+        headers["content-type"] = "application/json"
+
+        def query(only_available):
+            body = {
+                "onlyAvailable": only_available,
+                "filterByBundle": False,
+                "filterByBookingV2Id": False,
+                "districtIds": DISTRICT_IDS,
+                "years": BIRTH_YEARS,
+            }
+            r = ctx.request.post(url, data=json.dumps(body), headers=headers, timeout=30000)
+            if not r.ok:
+                raise RuntimeError(f"Kurslistan svarade {r.status}")
+            return r.json()
+
+        avail, everything = query(True), query(False)
         browser.close()
-    return payloads
+    return (pages[0] if pages else {}), avail, everything
 
 
 # ----------------------------- tolka data ----------------------------------
@@ -141,36 +180,32 @@ def dump(d):
     return json.dumps(d, ensure_ascii=False)
 
 
-def find_payload(payloads, needle):
-    for url, p in payloads:
-        if needle in url.split("?")[0]:
-            return p
-    return None
+def read_offerings(resp):
+    ents = resp.get("entities") if isinstance(resp, dict) else None
+    if not isinstance(ents, list):
+        raise RuntimeError("Oväntat svar från kurslistan - ändrad sidstruktur?")
+    return {
+        str(e["offeringBaseId"]): str(e.get("publicName") or "")
+        for e in ents
+        if isinstance(e, dict) and e.get("offeringBaseId") is not None
+    }
 
 
-def read_signals(payloads):
-    """Plockar ut bannertext och kurstyper ur katalogens dataanrop."""
-    cat = find_payload(payloads, "getcoursecatalogueofferingbasesbyfilter")
-    if not isinstance(cat, dict) or not isinstance(cat.get("entities"), list):
-        raise RuntimeError("Hittade inte kurslistan i katalogen - ändrad sidstruktur?")
-    page = find_payload(payloads, "/getpage")
-    data = page.get("data") if isinstance(page, dict) else None
+def read_banner(page_payload):
+    data = page_payload.get("data") if isinstance(page_payload, dict) else None
     data = data if isinstance(data, dict) else {}
-
-    banner = " ".join(str(data.get("spotsTitle") or "").split())
+    title = " ".join(str(data.get("spotsTitle") or "").split())
     spots = " | ".join(
         " ".join(str(sp.get(k) or "") for k in ("headline1", "description")).strip()
         for sp in (data.get("spots") or [])
         if isinstance(sp, dict)
     )
-    offerings = {}
-    for e in cat["entities"]:
-        if isinstance(e, dict) and e.get("offeringBaseId") is not None:
-            offerings[str(e["offeringBaseId"])] = {
-                "name": str(e.get("publicName") or ""),
-                "direct": bool(e.get("hasDirectBooking")),
-            }
-    return {"banner": banner, "spots": " ".join(spots.split()), "offerings": offerings}
+    return title, " ".join(spots.split())
+
+
+def split_scope(offerings, scope):
+    want_short = scope == "short"
+    return {k: n for k, n in offerings.items() if bool(SHORT_RE.search(n)) == want_short}
 
 
 # ------------------------------ tillstånd ----------------------------------
@@ -181,7 +216,7 @@ def load_state():
         if state.get("version") != STATE_VERSION:
             state = {}
     state["version"] = STATE_VERSION
-    state.setdefault("signals", None)   # None = ingen tidigare körning
+    state.setdefault("scopes", {})
     state.setdefault("failures", 0)
     state.setdefault("warned", False)
     return state
@@ -191,33 +226,36 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-def diff_and_notify(cur, prev):
+LABEL = {"long": "långa kurser", "short": "korta kurser"}
+
+
+def diff_and_notify(scope, cur, prev):
     """Jämför med förra kontrollen och notifierar. Returnerar nytt läge."""
+    names = list(cur["avail"].values())
     if prev is None:  # första kontrollen: skicka en sammanfattning
+        now_txt = ", ".join(names[:10]) if names else "inga just nu"
         notify(
-            "Bevakning igång",
-            f"{len(cur['offerings'])} kurstyper i katalogen just nu. "
-            f"Katalogen säger: {cur['banner'] or '(ingen bannertext)'}",
+            f"Bevakning igång ({LABEL[scope]})",
+            f"Bokningsbart på Kungsholmen för födda 2020: {now_txt}.",
             priority=3,
             tags=["eyes"],
         )
         return cur
 
-    if (cur["banner"], cur["spots"]) != (prev.get("banner"), prev.get("spots")):
-        notify("Kulturskolans katalog har ändrats", cur["banner"] or cur["spots"][:300],
+    old = prev.get("avail", {})
+    new = [n for k, n in cur["avail"].items() if k not in old]
+    if new:
+        more = f" (+{len(new) - 10} till)" if len(new) > 10 else ""
+        notify(
+            "Ledig plats: Kungsholmen, född 2020",
+            ", ".join(new[:10]) + more,
+            priority=5,
+            tags=["tada"],
+        )
+
+    if scope == "long" and (cur.get("banner"), cur.get("spots")) != (prev.get("banner"), prev.get("spots")):
+        notify("Kulturskolans katalog har ändrats", cur.get("banner") or cur.get("spots", "")[:300],
                priority=5, tags=["rotating_light"])
-
-    old = prev.get("offerings", {})
-    new_names = [o["name"] for k, o in cur["offerings"].items() if k not in old]
-    if new_names:
-        more = f" (+{len(new_names) - 15} till)" if len(new_names) > 15 else ""
-        notify(f"{len(new_names)} nya kurstyper i katalogen", ", ".join(new_names[:15]) + more,
-               priority=5, tags=["tada"])
-
-    opened = [o["name"] for k, o in cur["offerings"].items()
-              if k in old and not old[k].get("direct") and o["direct"]]
-    if opened:
-        notify("Bokning öppen", ", ".join(opened[:15]), priority=5, tags=["white_check_mark"])
     return cur
 
 
@@ -374,16 +412,31 @@ def discover():
     print("\nRådata sparad i discover_dump.json")
 
 
-def check_once(force=False):
-    ok, why = should_run(force)
-    if not ok:
-        print(f"[{datetime.now(TZ):%Y-%m-%d %H:%M}] Hoppar över: {why}")
+def check_once(scope="long", force=False):
+    scopes = ["long", "short"] if scope == "all" else [scope]
+    now = datetime.now(TZ)
+    todo = []
+    for sc in scopes:
+        ok, why = should_run(sc, force, now)
+        if ok:
+            todo.append(sc)
+        else:
+            print(f"[{now:%Y-%m-%d %H:%M}] {LABEL[sc]}: hoppar över ({why})")
+    if not todo:
         return
+
     state = load_state()
     try:
-        cur = read_signals(fetch_payloads())
-        print(f"[{datetime.now(TZ):%Y-%m-%d %H:%M}] {len(cur['offerings'])} kurstyper. Banner: {cur['banner'][:120]}")
-        state["signals"] = diff_and_notify(cur, state["signals"])
+        page_payload, avail_resp, all_resp = fetch_catalogue()
+        avail, everything = read_offerings(avail_resp), read_offerings(all_resp)
+        banner, spots = read_banner(page_payload)
+        print(f"[{now:%Y-%m-%d %H:%M}] Kungsholmen/2020: {len(avail)} bokningsbara av {len(everything)} kurstyper")
+        for sc in todo:
+            cur = {"avail": split_scope(avail, sc)}
+            if sc == "long":
+                cur["banner"], cur["spots"] = banner, spots
+            print(f"  {LABEL[sc]}: bokningsbara = {list(cur['avail'].values())}")
+            state["scopes"][sc] = diff_and_notify(sc, cur, state["scopes"].get(sc))
         state["failures"], state["warned"] = 0, False
     except Exception as e:  # nätfel, ändrad sida osv. Misslyckas tyst men varnar en gång.
         state["failures"] += 1
@@ -397,9 +450,10 @@ def check_once(force=False):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--test", action="store_true", help="skicka testnotis")
-    ap.add_argument("--discover", action="store_true", help="visa vad katalogen levererar")
+    ap.add_argument("--discover", action="store_true", help="utforska katalogens dataanrop")
     ap.add_argument("--loop", action="store_true", help="kör kontinuerligt")
     ap.add_argument("--force", action="store_true", help="ignorera tider och perioder")
+    ap.add_argument("--scope", choices=["long", "short", "all"], default="long")
     args = ap.parse_args()
 
     if args.test:
@@ -409,10 +463,10 @@ def main():
         discover()
     elif args.loop:
         while True:
-            check_once(args.force)
+            check_once(args.scope, args.force)
             time.sleep(INTERVAL_SECONDS)
     else:
-        check_once(args.force)
+        check_once(args.scope, args.force)
 
 
 if __name__ == "__main__":
