@@ -158,7 +158,11 @@ def fetch_catalogue():
             raise RuntimeError("Såg inget anrop till kurslistan - ändrad sidstruktur?")
 
         url = seen["req"].url
-        headers = {k: v for k, v in seen["req"].all_headers().items() if k.lower() not in DROP_HEADERS}
+        headers = {
+            k: v
+            for k, v in seen["req"].all_headers().items()
+            if not k.startswith(":") and k.lower() not in DROP_HEADERS  # ":authority" m.fl. är interna
+        }
         headers["content-type"] = "application/json"
 
         def query(only_available):
