@@ -22,7 +22,7 @@ BANNERN
   för långa kurser meddelas.
 
 TIDER
-  Inga kontroller och inga notiser mellan 20:00 och 08:00 (svensk tid).
+  Inga kontroller och inga notiser mellan 20:00 och 07:00 (svensk tid).
 
 KÖRNING
   Avsett att köras av GitHub Actions (se kulturskolan.yml). På en vanlig dator:
@@ -56,7 +56,7 @@ BIRTH_YEARS = [2020]   # barnet är fött 2020
 SHORT_RE = re.compile(r"korta|lovkurs|dagkollo|prova på", re.I)
 
 TZ = ZoneInfo("Europe/Stockholm")
-AWAKE_FROM, AWAKE_TO = 8, 20        # kontroller/notiser bara 08:00-20:00
+AWAKE_FROM, AWAKE_TO = 7, 20        # kontroller/notiser bara 07:00-20:00
 
 # Perioder för bevakningen av långa kurser, som (start, slut) i "MM-DD".
 # Perioder får gå över årsskiftet. Tom lista = alltid på. De korta kurserna
