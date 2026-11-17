@@ -1,6 +1,6 @@
 {
- "version": 2,
- "courses": {},
- "failures": 0,
+ "version": 5,
+ "scopes": {},
+ "failures": 1,
  "warned": false
 }
