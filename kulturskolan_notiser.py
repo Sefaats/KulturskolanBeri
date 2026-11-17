@@ -62,6 +62,7 @@ ACTIVE_PERIODS = [
 
 INTERVAL_SECONDS = 600              # bara för --loop. Gå inte under ca 5 min.
 STATE_FILE = Path(__file__).with_name("kulturskolan_state.json")
+STATE_VERSION = 2   # höj när tolkningen ändras, så nollställs gammalt tillstånd
 # --------------------------------------------------------------------------
 
 ID_KEYS = ("id", "courseId", "course_id", "offeringId", "courseOfferingId",
@@ -284,6 +285,9 @@ def load_state():
     state = {}
     if STATE_FILE.exists():
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if state.get("version") != STATE_VERSION:
+            state = {}
+    state["version"] = STATE_VERSION
     state.setdefault("courses", None)   # None = ingen tidigare körning
     state.setdefault("failures", 0)
     state.setdefault("warned", False)
@@ -336,26 +340,96 @@ def shape(o, indent=0, depth=4):
     return pad + repr(o)[:70]
 
 
+def _noise(url):
+    return "locales" in url or "session" in url
+
+
 def discover():
-    payloads = fetch_payloads()
-    print(f"{len(payloads)} JSON-svar fångade:")
-    for url, p in payloads:
-        print(f"  {len(dump(p)):>8} tecken  {url}")
-    for url, p in payloads:  # struktur för datakällor (inte sessions- eller språkfiler)
-        if "session" in url or "locales" in url:
-            continue
-        print(f"\n=== STRUKTUR: {url}")
-        print(shape(p)[:3500])
-    courses, _ = extract_courses(payloads)
-    if courses:
-        print("\n=== EXEMPEL PÅ EN TOLKAD KURS (rå JSON):")
-        print(dump(courses[0])[:1500])
-    n, matches = select_matches(payloads)
-    print(f"\nTolkade {n} kurser, {len(matches)} matchar Kungsholmen + ålder {sorted(AGES)}:")
-    for m in matches.values():
-        print(f"  - {m['label']}  (platser lediga: {m['available']})")
+    """Utforskar katalogen som en besökare och skriver ut vilka dataanrop som görs."""
+    from playwright.sync_api import sync_playwright
+
+    payloads, reqs = [], []
+    stage = {"name": "1"}
+
+    def on_request(req):
+        u = req.url
+        if "speedadmin.dk" in u and not _noise(u) and req.resource_type in ("xhr", "fetch"):
+            reqs.append((stage["name"], req.method, u, (req.post_data or "")[:1500]))
+
+    def on_response(resp):
+        try:
+            if "json" in (resp.headers.get("content-type") or ""):
+                payloads.append((stage["name"], resp.url, resp.json()))
+        except Exception:
+            pass
+
+    def show_new(r0, p0):
+        for st, m, u, body in reqs[r0:]:
+            print(f"  ANROP [{st}] {m} {u}")
+            if body:
+                print(f"      BODY: {body}")
+        for st, u, pl in payloads[p0:]:
+            if _noise(u):
+                continue
+            print(f"  SVAR {u}  ({len(dump(pl))} tecken)")
+            print(shape(pl, indent=2, depth=4)[:2500])
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        page = browser.new_context(locale="sv-SE").new_page()
+        page.on("request", on_request)
+        page.on("response", on_response)
+
+        def step(label, fn):
+            stage["name"] = label
+            r0, p0 = len(reqs), len(payloads)
+            print(f"\n##### STEG {label}")
+            try:
+                fn()
+                page.wait_for_timeout(2500)
+            except Exception as e:
+                print(f"  (misslyckades: {str(e)[:200]})")
+            show_new(r0, p0)
+            try:
+                print("  --- SYNLIG TEXT:")
+                print("  " + page.inner_text("body")[:3000].replace("\n", "\n  "))
+            except Exception:
+                pass
+
+        step("1 sidladdning", lambda: page.goto(CATALOGUE_URL, wait_until="networkidle", timeout=60000))
+
+        for _, u, pl in payloads:  # bannertexten i sin helhet
+            if u.endswith("/getpage") and isinstance(pl, dict):
+                data = pl.get("data", {}) or {}
+                print("\nBANNER:", data.get("spotsTitle"))
+                for sp in data.get("spots", []) or []:
+                    print("SPOT:", sp.get("headline1"), "|", str(sp.get("description"))[:1500])
+
+        def open_filter():
+            for pat in ("filtrera|filter", "stadsdel", "område"):
+                try:
+                    page.get_by_text(re.compile(pat, re.I)).first.click(timeout=3000)
+                    return
+                except Exception:
+                    continue
+            raise RuntimeError("hittade ingen filterknapp")
+
+        step("2 oppna filter", open_filter)
+
+        def open_course():
+            for _, u, pl in payloads:
+                if isinstance(pl, dict) and pl.get("entities"):
+                    name = pl["entities"][0].get("publicName")
+                    page.get_by_text(name, exact=False).first.click(timeout=5000)
+                    return
+            raise RuntimeError("ingen kurs att öppna")
+
+        step("3 oppna kurs", open_course)
+        print("\nSIDANS ADRESS NU:", page.url)
+        browser.close()
+
     Path("discover_dump.json").write_text(
-        json.dumps([{"url": u, "data": p} for u, p in payloads], ensure_ascii=False, indent=1),
+        json.dumps([{"url": u, "data": d} for _, u, d in payloads if not _noise(u)], ensure_ascii=False, indent=1),
         encoding="utf-8",
     )
     print("\nRådata sparad i discover_dump.json")
