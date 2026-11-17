@@ -2,12 +2,13 @@
 """
 Bevakar Kulturskolan Stockholms kurskatalog och skickar notiser via ntfy.
 
-Bevakar: kurser på Kungsholmen / Kungsholmens kulturhus för barn födda 2020
-(ålder 6-7 under hösten 2026 och våren 2027).
-
-Du får notis när
-  1. en NY kurs dyker upp som matchar, eller
-  2. en kurs som var full får LEDIGA platser (om katalogen anger platsantal).
+Katalogens lista innehåller kurstyper (t.ex. "Piano - långa kurser") men inte
+plats, ålder eller lediga platser, så bevakningen kan inte filtrera på
+Kungsholmen eller födelseår. I stället får du notis när:
+  1. bannertexten i katalogen ändras (t.ex. "vårens långa kurser är öppna"),
+  2. nya kurstyper dyker upp i katalogen,
+  3. en kurstyp blir direktbokningsbar.
+Använd sedan filtren Födelseår 2020 och Stadsdel Kungsholmen i katalogen.
 
 TIDER
   - Inga kontroller och inga notiser mellan 20:00 och 08:00 (svensk tid).
@@ -20,13 +21,10 @@ KÖRNING
     pip install requests playwright && playwright install chromium
     export NTFY_TOPIC="ditt-hemliga-amnesnamn"
     python kulturskolan_notiser.py --test        # testnotis
-    python kulturskolan_notiser.py --discover    # visa vad katalogen levererar
+    python kulturskolan_notiser.py --discover    # utforska katalogens dataanrop
     python kulturskolan_notiser.py               # en kontroll (för schema/cron)
     python kulturskolan_notiser.py --loop        # kontrollerar var 10:e minut
     Lägg till --force för att köra utanför tider/perioder (t.ex. vid test).
-
-OBS: Skriptet har skrivits utan att kunna nå Speedadmin från testmiljön.
-Kör --discover först. Fungerar inte filtreringen, justera inställningarna nedan.
 """
 import argparse
 import json
@@ -45,9 +43,6 @@ CATALOGUE_URL = "https://sestockholm.speedadmin.dk/play/catalogue/courses"
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 
-LOCATION_KEYWORDS = ["kungsholm"]   # matchar Kungsholmen och Kungsholmens kulturhus
-AGES = {6, 7}                       # barn födda 2020 (lägg till 8 från hösten 2027)
-
 TZ = ZoneInfo("Europe/Stockholm")
 AWAKE_FROM, AWAKE_TO = 8, 20        # kontroller/notiser bara 08:00-20:00
 
@@ -62,17 +57,8 @@ ACTIVE_PERIODS = [
 
 INTERVAL_SECONDS = 600              # bara för --loop. Gå inte under ca 5 min.
 STATE_FILE = Path(__file__).with_name("kulturskolan_state.json")
-STATE_VERSION = 2   # höj när tolkningen ändras, så nollställs gammalt tillstånd
+STATE_VERSION = 3   # höj när tolkningen ändras, så nollställs gammalt tillstånd
 # --------------------------------------------------------------------------
-
-ID_KEYS = ("id", "courseId", "course_id", "offeringId", "courseOfferingId",
-           "courseCatalogueOfferingId", "offeringBaseId")
-NAME_KEYS = ("name", "title", "courseName", "course_name", "displayName",
-             "offeringName", "publicName", "externalName")
-SEAT_KEY_RE = re.compile(r"(avail|free|vacan|remain|ledig|spots|seats|places)", re.I)
-FULL_KEY_RE = re.compile(r"(is_?full|fully_?booked|full$|soldout|sold_out)", re.I)
-LOC_KEY_RE = re.compile(r"(loc|place|venue|room|site|department|area|unit|district|stadsdel|school)", re.I)
-
 
 # ------------------------------- tider ------------------------------------
 def in_active_period(now):
@@ -151,133 +137,40 @@ def fetch_payloads():
 
 
 # ----------------------------- tolka data ----------------------------------
-def first_key(d, keys):
-    """Hämtar första befintliga nyckeln, oavsett stora/små bokstäver."""
-    lower = {k.lower(): v for k, v in d.items() if isinstance(k, str)}
-    for k in keys:
-        v = lower.get(k.lower())
-        if v not in (None, "", []):
-            return v
-    return None
-
-
-def is_course(d):
-    name = first_key(d, NAME_KEYS)
-    return isinstance(name, str) and first_key(d, ID_KEYS) is not None
-
-
-def outermost_courses(obj, out):
-    """Hittar yttersta dicts med id + namn (kurser), utan att gå in i dem."""
-    if isinstance(obj, dict):
-        if is_course(obj):
-            out.append(obj)
-            return
-        for v in obj.values():
-            outermost_courses(v, out)
-    elif isinstance(obj, list):
-        for v in obj:
-            outermost_courses(v, out)
-
-
-def all_dicts(obj):
-    if isinstance(obj, dict):
-        yield obj
-        for v in obj.values():
-            yield from all_dicts(v)
-    elif isinstance(obj, list):
-        for v in obj:
-            yield from all_dicts(v)
-
-
 def dump(d):
     return json.dumps(d, ensure_ascii=False)
 
 
-def extract_courses(payloads):
-    """Returnerar (lista med kurser, mängd med id:n för platser som matchar)."""
-    pool = [(u, p) for u, p in payloads if "speedadmin" in u]
-    course_pool = [(u, p) for u, p in pool if "cours" in u.lower()] or pool
-
-    courses = []
-    for _, p in course_pool:
-        outermost_courses(p, courses)
-
-    course_ids = {id(c) for c in courses}
-    loc_ids = set()
-    for _, p in pool:  # separata platslistor (id -> namn)
-        for d in all_dicts(p):
-            if id(d) in course_ids or not is_course(d):
-                continue
-            txt = dump(d).lower()
-            if len(txt) < 1500 and any(k in txt for k in LOCATION_KEYWORDS):
-                loc_ids.add(str(first_key(d, ID_KEYS)))
-    return courses, loc_ids
-
-
-def matches_location(course, loc_ids):
-    txt = dump(course).lower()
-    if any(k in txt for k in LOCATION_KEYWORDS):
-        return True
-    for k, v in course.items():
-        if LOC_KEY_RE.search(k) and k.lower().endswith(("id", "ids")):
-            vals = v if isinstance(v, list) else [v]
-            if any(str(x) in loc_ids for x in vals):
-                return True
-    return False
-
-
-def age_ranges(text):
-    t = text.lower()
-    ranges = []
-    for a, b in re.findall(r"(\d{1,2})\s*[-–]\s*(\d{1,2})\s*år", t):
-        ranges.append((int(a), int(b)))
-    for a in re.findall(r"(?:från|fr\.o\.m\.?)\s*(\d{1,2})\s*år", t):
-        ranges.append((int(a), 99))
-    for a in re.findall(r"(\d{1,2})\s*år\s*(?:eller|och)\s*(?:äldre|uppåt)", t):
-        ranges.append((int(a), 99))
-    lo = re.search(r"min_?age\W+(\d{1,2})", t)
-    hi = re.search(r"max_?age\W+(\d{1,2})", t)
-    if lo:
-        ranges.append((int(lo.group(1)), int(hi.group(1)) if hi else 99))
-    return ranges
-
-
-def matches_age(course):
-    rs = age_ranges(dump(course))
-    if not rs:
-        return True, False  # ålder okänd -> ta med, men markera
-    return any(lo <= a <= hi for lo, hi in rs for a in AGES), True
-
-
-def seats_available(course):
-    """True/False om det går att utläsa, annars None."""
-    for k, v in course.items():
-        if FULL_KEY_RE.search(k) and isinstance(v, bool):
-            return not v
-    for k, v in course.items():
-        if SEAT_KEY_RE.search(k) and isinstance(v, (int, float)) and not isinstance(v, bool):
-            return v > 0
+def find_payload(payloads, needle):
+    for url, p in payloads:
+        if needle in url.split("?")[0]:
+            return p
     return None
 
 
-def course_label(course, age_known):
-    name = first_key(course, NAME_KEYS)
-    return name if age_known else f"{name} (ålder ej angiven)"
+def read_signals(payloads):
+    """Plockar ut bannertext och kurstyper ur katalogens dataanrop."""
+    cat = find_payload(payloads, "getcoursecatalogueofferingbasesbyfilter")
+    if not isinstance(cat, dict) or not isinstance(cat.get("entities"), list):
+        raise RuntimeError("Hittade inte kurslistan i katalogen - ändrad sidstruktur?")
+    page = find_payload(payloads, "/getpage")
+    data = page.get("data") if isinstance(page, dict) else None
+    data = data if isinstance(data, dict) else {}
 
-
-def select_matches(payloads):
-    courses, loc_ids = extract_courses(payloads)
-    result = {}
-    for c in courses:
-        if not matches_location(c, loc_ids):
-            continue
-        ok, known = matches_age(c)
-        if ok:
-            result[str(first_key(c, ID_KEYS))] = {
-                "label": course_label(c, known),
-                "available": seats_available(c),
+    banner = " ".join(str(data.get("spotsTitle") or "").split())
+    spots = " | ".join(
+        " ".join(str(sp.get(k) or "") for k in ("headline1", "description")).strip()
+        for sp in (data.get("spots") or [])
+        if isinstance(sp, dict)
+    )
+    offerings = {}
+    for e in cat["entities"]:
+        if isinstance(e, dict) and e.get("offeringBaseId") is not None:
+            offerings[str(e["offeringBaseId"])] = {
+                "name": str(e.get("publicName") or ""),
+                "direct": bool(e.get("hasDirectBooking")),
             }
-    return len(courses), result
+    return {"banner": banner, "spots": " ".join(spots.split()), "offerings": offerings}
 
 
 # ------------------------------ tillstånd ----------------------------------
@@ -288,7 +181,7 @@ def load_state():
         if state.get("version") != STATE_VERSION:
             state = {}
     state["version"] = STATE_VERSION
-    state.setdefault("courses", None)   # None = ingen tidigare körning
+    state.setdefault("signals", None)   # None = ingen tidigare körning
     state.setdefault("failures", 0)
     state.setdefault("warned", False)
     return state
@@ -298,26 +191,34 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-def diff_and_notify(current, previous):
-    """Jämför med förra kontrollen och notifierar. Returnerar nytt kursläge."""
-    if previous is None:  # första kontrollen: skicka en sammanfattning
+def diff_and_notify(cur, prev):
+    """Jämför med förra kontrollen och notifierar. Returnerar nytt läge."""
+    if prev is None:  # första kontrollen: skicka en sammanfattning
         notify(
             "Bevakning igång",
-            f"Hittade {len(current)} matchande kurser just nu. Du får notis när nya kommer "
-            f"eller när platser blir lediga.",
+            f"{len(cur['offerings'])} kurstyper i katalogen just nu. "
+            f"Katalogen säger: {cur['banner'] or '(ingen bannertext)'}",
             priority=3,
             tags=["eyes"],
         )
-        return current
+        return cur
 
-    for key, c in current.items():
-        old = previous.get(key)
-        if old is None:
-            avail = " - lediga platser!" if c["available"] else ""
-            notify("Ny kurs på Kungsholmen", f"{c['label']}{avail}", priority=5, tags=["tada"])
-        elif old.get("available") is False and c["available"] is True:
-            notify("Plats ledig!", c["label"], priority=5, tags=["rotating_light"])
-    return current
+    if (cur["banner"], cur["spots"]) != (prev.get("banner"), prev.get("spots")):
+        notify("Kulturskolans katalog har ändrats", cur["banner"] or cur["spots"][:300],
+               priority=5, tags=["rotating_light"])
+
+    old = prev.get("offerings", {})
+    new_names = [o["name"] for k, o in cur["offerings"].items() if k not in old]
+    if new_names:
+        more = f" (+{len(new_names) - 15} till)" if len(new_names) > 15 else ""
+        notify(f"{len(new_names)} nya kurstyper i katalogen", ", ".join(new_names[:15]) + more,
+               priority=5, tags=["tada"])
+
+    opened = [o["name"] for k, o in cur["offerings"].items()
+              if k in old and not old[k].get("direct") and o["direct"]]
+    if opened:
+        notify("Bokning öppen", ", ".join(opened[:15]), priority=5, tags=["white_check_mark"])
+    return cur
 
 
 # ------------------------------ huvudlogik ---------------------------------
@@ -380,7 +281,7 @@ def discover():
         page.on("request", on_request)
         page.on("response", on_response)
 
-        def step(label, fn):
+        def step(label, fn, text=False):
             stage["name"] = label
             r0, p0 = len(reqs), len(payloads)
             print(f"\n##### STEG {label}")
@@ -390,13 +291,14 @@ def discover():
             except Exception as e:
                 print(f"  (misslyckades: {str(e)[:200]})")
             show_new(r0, p0)
-            try:
-                print("  --- SYNLIG TEXT:")
-                print("  " + page.inner_text("body")[:3000].replace("\n", "\n  "))
-            except Exception:
-                pass
+            if text:
+                try:
+                    print("  --- SYNLIG TEXT:")
+                    print("  " + page.inner_text("body")[:3000].replace("\n", "\n  "))
+                except Exception:
+                    pass
 
-        step("1 sidladdning", lambda: page.goto(CATALOGUE_URL, wait_until="networkidle", timeout=60000))
+        step("1 sidladdning", lambda: page.goto(CATALOGUE_URL, wait_until="networkidle", timeout=60000), text=False)
 
         for _, u, pl in payloads:  # bannertexten i sin helhet
             if u.endswith("/getpage") and isinstance(pl, dict):
@@ -405,26 +307,63 @@ def discover():
                 for sp in data.get("spots", []) or []:
                     print("SPOT:", sp.get("headline1"), "|", str(sp.get("description"))[:1500])
 
-        def open_filter():
-            for pat in ("filtrera|filter", "stadsdel", "område"):
-                try:
-                    page.get_by_text(re.compile(pat, re.I)).first.click(timeout=3000)
-                    return
-                except Exception:
-                    continue
-            raise RuntimeError("hittade ingen filterknapp")
+        def describe_filters():
+            labels = ["Ämne", "Födelseår", "Stadsdel", "Plats", "Veckodag", "Kursnivå", "Visa bokningsbara tider"]
+            res = page.evaluate(
+                """(labels) => {
+                  const out = [];
+                  for (const el of document.querySelectorAll('label,button,span,div,p,legend,h2,h3,h4')) {
+                    const t = (el.textContent || '').trim();
+                    if (labels.includes(t) && el.children.length < 3) {
+                      const par = el.parentElement ? el.parentElement.outerHTML.slice(0, 450) : '';
+                      out.push(el.tagName + '.' + (el.className || '') + ' :: ' + par);
+                    }
+                  }
+                  return out.slice(0, 14);
+                }""",
+                labels,
+            )
+            for r in res:
+                print("  FILTERELEMENT:", r)
 
-        step("2 oppna filter", open_filter)
+        def list_options():
+            seen, out = set(), []
+            for t in page.locator("[role=option], [role=listbox] *, li, label").all_inner_texts():
+                t = " ".join(t.split())
+                if t and len(t) <= 40 and t not in seen:
+                    seen.add(t)
+                    out.append(t)
+            print("  ALTERNATIV:", out[:80])
+
+        def click_text(*patterns, then_list=False):
+            def run():
+                for pat in patterns:
+                    try:
+                        page.get_by_text(re.compile(pat, re.I)).first.click(timeout=3000, force=True)
+                        if then_list:
+                            page.wait_for_timeout(800)
+                            list_options()
+                        return
+                    except Exception:
+                        continue
+                raise RuntimeError(f"hittade inget att klicka på: {patterns}")
+            return run
 
         def open_course():
-            for _, u, pl in payloads:
-                if isinstance(pl, dict) and pl.get("entities"):
-                    name = pl["entities"][0].get("publicName")
-                    page.get_by_text(name, exact=False).first.click(timeout=5000)
-                    return
-            raise RuntimeError("ingen kurs att öppna")
+            page.locator(".offering-base-card-header").first.click(timeout=5000, force=True)
 
-        step("3 oppna kurs", open_course)
+        print("\n##### FILTER-ELEMENT I SIDAN")
+        try:
+            describe_filters()
+        except Exception as e:
+            print(f"  (misslyckades: {str(e)[:200]})")
+
+        step("2 oppna Stadsdel", click_text("^stadsdel$", "stadsdel", then_list=True))
+        step("3 valj Kungsholmen", click_text("^kungsholmen$", "kungsholm"))
+        step("4 oppna Fodelsear", click_text("^födelseår$", "födelseår", then_list=True))
+        step("5 valj 2020", click_text("^2020$"))
+        step("6 Visa bokningsbara tider", click_text("visa bokningsbara tider"), text=True)
+        step("7 oppna forsta kursen", open_course, text=True)
         print("\nSIDANS ADRESS NU:", page.url)
         browser.close()
 
@@ -442,11 +381,9 @@ def check_once(force=False):
         return
     state = load_state()
     try:
-        n, matches = select_matches(fetch_payloads())
-        if n == 0:
-            raise RuntimeError("Hittade inga kurser i katalogen - ändrad sidstruktur?")
-        print(f"[{datetime.now(TZ):%Y-%m-%d %H:%M}] {n} kurser tolkade, {len(matches)} matchar")
-        state["courses"] = diff_and_notify(matches, state["courses"])
+        cur = read_signals(fetch_payloads())
+        print(f"[{datetime.now(TZ):%Y-%m-%d %H:%M}] {len(cur['offerings'])} kurstyper. Banner: {cur['banner'][:120]}")
+        state["signals"] = diff_and_notify(cur, state["signals"])
         state["failures"], state["warned"] = 0, False
     except Exception as e:  # nätfel, ändrad sida osv. Misslyckas tyst men varnar en gång.
         state["failures"] += 1
