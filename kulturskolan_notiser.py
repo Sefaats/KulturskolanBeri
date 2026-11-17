@@ -64,8 +64,10 @@ INTERVAL_SECONDS = 600              # bara för --loop. Gå inte under ca 5 min.
 STATE_FILE = Path(__file__).with_name("kulturskolan_state.json")
 # --------------------------------------------------------------------------
 
-ID_KEYS = ("id", "courseId", "course_id", "courseID")
-NAME_KEYS = ("name", "title", "courseName", "course_name", "displayName")
+ID_KEYS = ("id", "courseId", "course_id", "offeringId", "courseOfferingId",
+           "courseCatalogueOfferingId", "offeringBaseId")
+NAME_KEYS = ("name", "title", "courseName", "course_name", "displayName",
+             "offeringName", "publicName", "externalName")
 SEAT_KEY_RE = re.compile(r"(avail|free|vacan|remain|ledig|spots|seats|places)", re.I)
 FULL_KEY_RE = re.compile(r"(is_?full|fully_?booked|full$|soldout|sold_out)", re.I)
 LOC_KEY_RE = re.compile(r"(loc|place|venue|room|site|department|area|unit|district|stadsdel|school)", re.I)
@@ -149,9 +151,12 @@ def fetch_payloads():
 
 # ----------------------------- tolka data ----------------------------------
 def first_key(d, keys):
+    """Hämtar första befintliga nyckeln, oavsett stora/små bokstäver."""
+    lower = {k.lower(): v for k, v in d.items() if isinstance(k, str)}
     for k in keys:
-        if k in d and d[k] not in (None, "", []):
-            return d[k]
+        v = lower.get(k.lower())
+        if v not in (None, "", []):
+            return v
     return None
 
 
@@ -312,11 +317,39 @@ def diff_and_notify(current, previous):
 
 
 # ------------------------------ huvudlogik ---------------------------------
+def shape(o, indent=0, depth=4):
+    """Kort beskrivning av datans struktur (nycklar och typer)."""
+    pad = "  " * indent
+    if depth == 0:
+        return pad + type(o).__name__
+    if isinstance(o, dict):
+        lines = []
+        for k, v in list(o.items())[:30]:
+            if isinstance(v, (dict, list)):
+                lines.append(f"{pad}{k}: {type(v).__name__}({len(v)})")
+                lines.append(shape(v, indent + 1, depth - 1))
+            else:
+                lines.append(f"{pad}{k}: {repr(v)[:70]}")
+        return "\n".join(lines)
+    if isinstance(o, list):
+        return f"{pad}[första av {len(o)}]\n" + shape(o[0], indent + 1, depth) if o else pad + "[]"
+    return pad + repr(o)[:70]
+
+
 def discover():
     payloads = fetch_payloads()
     print(f"{len(payloads)} JSON-svar fångade:")
     for url, p in payloads:
         print(f"  {len(dump(p)):>8} tecken  {url}")
+    for url, p in payloads:  # struktur för datakällor (inte sessions- eller språkfiler)
+        if "session" in url or "locales" in url:
+            continue
+        print(f"\n=== STRUKTUR: {url}")
+        print(shape(p)[:3500])
+    courses, _ = extract_courses(payloads)
+    if courses:
+        print("\n=== EXEMPEL PÅ EN TOLKAD KURS (rå JSON):")
+        print(dump(courses[0])[:1500])
     n, matches = select_matches(payloads)
     print(f"\nTolkade {n} kurser, {len(matches)} matchar Kungsholmen + ålder {sorted(AGES)}:")
     for m in matches.values():
