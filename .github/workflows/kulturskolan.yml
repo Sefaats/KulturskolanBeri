@@ -1,0 +1,61 @@
+name: Bevaka Kulturskolan
+
+on:
+  schedule:
+    # Var 15:e minut kl 06-19 UTC (= ca 07-21 svensk tid). Skriptet sköter
+    # den exakta tysta tiden 20:00-08:00 och bevakningsperioderna.
+    - cron: "*/15 6-19 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Läge"
+        type: choice
+        options: [normal, test, discover]
+        default: normal
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kulturskolan
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installera beroenden
+        run: |
+          pip install requests playwright
+          playwright install --with-deps chromium
+
+      - name: Kör bevakningen
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          case "${{ inputs.mode }}" in
+            test)     python kulturskolan_notiser.py --test ;;
+            discover) python kulturskolan_notiser.py --discover ;;
+            *)        python kulturskolan_notiser.py ;;
+          esac
+
+      - name: Spara rådata vid discover
+        if: ${{ inputs.mode == 'discover' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: discover-dump
+          path: discover_dump.json
+
+      - name: Spara tillstånd
+        run: |
+          git config user.name "kulturskole-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add kulturskolan_state.json 2>/dev/null || true
+          git diff --cached --quiet || (git commit -m "Uppdatera tillstånd" && git push)
