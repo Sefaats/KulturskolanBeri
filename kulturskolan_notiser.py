@@ -12,10 +12,14 @@ Kurstyper utan lediga platser, på annan plats eller för annan ålder ger ingen
 
 TVÅ BEVAKNINGAR (--scope)
   long   Långa kurser (allt som inte är korta kurser). Kollas var 30:e minut,
-         var 5:e minut den 18 december, bara under ACTIVE_PERIODS. Notis också
-         om bannertexten i katalogen ändras.
+         var 5:e minut den 18 december, bara under ACTIVE_PERIODS.
   short  Korta kurser, lovkurser, dagkollo och prova på. Kollas en gång per dag,
          året runt.
+
+BANNERN
+  Vid varje lyckad kontroll (även den dagliga) jämförs bannertexten i katalogen
+  med förra gången. Ändras den får du en notis, t.ex. när nästa öppningsdatum
+  för långa kurser meddelas.
 
 TIDER
   Inga kontroller och inga notiser mellan 20:00 och 08:00 (svensk tid).
@@ -65,7 +69,7 @@ ACTIVE_PERIODS = [
 
 INTERVAL_SECONDS = 1800             # bara för --loop
 STATE_FILE = Path(__file__).with_name("kulturskolan_state.json")
-STATE_VERSION = 4   # höj när tolkningen ändras, så nollställs gammalt tillstånd
+STATE_VERSION = 5   # höj när tolkningen ändras, så nollställs gammalt tillstånd
 # --------------------------------------------------------------------------
 
 LIST_URL_PART = "getcoursecatalogueofferingbasesbyfilter"
@@ -253,9 +257,6 @@ def diff_and_notify(scope, cur, prev):
             tags=["tada"],
         )
 
-    if scope == "long" and (cur.get("banner"), cur.get("spots")) != (prev.get("banner"), prev.get("spots")):
-        notify("Kulturskolans katalog har ändrats", cur.get("banner") or cur.get("spots", "")[:300],
-               priority=5, tags=["rotating_light"])
     return cur
 
 
@@ -431,10 +432,12 @@ def check_once(scope="long", force=False):
         avail, everything = read_offerings(avail_resp), read_offerings(all_resp)
         banner, spots = read_banner(page_payload)
         print(f"[{now:%Y-%m-%d %H:%M}] Kungsholmen/2020: {len(avail)} bokningsbara av {len(everything)} kurstyper")
+        sig = [banner, spots]
+        if state.get("banner_sig") not in (None, sig):  # bannern i katalogen har ändrats
+            notify("Kulturskolans katalog har ändrats", banner or spots[:300], priority=5, tags=["rotating_light"])
+        state["banner_sig"] = sig
         for sc in todo:
             cur = {"avail": split_scope(avail, sc)}
-            if sc == "long":
-                cur["banner"], cur["spots"] = banner, spots
             print(f"  {LABEL[sc]}: bokningsbara = {list(cur['avail'].values())}")
             state["scopes"][sc] = diff_and_notify(sc, cur, state["scopes"].get(sc))
         state["failures"], state["warned"] = 0, False
